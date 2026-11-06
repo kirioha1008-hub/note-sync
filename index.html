@@ -1,11 +1,619 @@
 <!doctype html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8">
-  <title>note同期ページ</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>note作業同期</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 16px;
+    background: #f4f7f6;
+    color: #26342f;
+    font: 15px/1.7 sans-serif;
+  }
+  main {
+    max-width: 620px;
+    margin: auto;
+    padding: 24px;
+    background: white;
+    border-radius: 16px;
+    box-shadow: 0 5px 24px #0001;
+  }
+  h1 { margin-top: 0; font-size: 23px; }
+  button {
+    padding: 12px 16px;
+    margin: 4px 5px 4px 0;
+    border: 0;
+    border-radius: 8px;
+    background: #168b70;
+    color: white;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .secondary { background: #53677c; }
+  .small { font-size: 13px; color: #65756d; }
+  #state {
+    background: #eaf8f2;
+    padding: 12px;
+    border-radius: 8px;
+    white-space: pre-wrap;
+  }
+  #log {
+    margin-top: 18px;
+    padding: 12px;
+    height: 230px;
+    overflow: auto;
+    background: #f5f6f7;
+    border-radius: 8px;
+    font: 12px/1.7 monospace;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  hr { border: 0; border-top: 1px solid #eee; margin: 22px 0; }
+</style>
 </head>
 <body>
-  <h1>note同期ページ</h1>
-  <p>初期設定中です。まだ同期機能はありません。</p>
+<main>
+  <h1>note作業同期</h1>
+
+  <p id="state">Googleには未接続です。</p>
+
+  <button id="connect" type="button">Googleに接続</button>
+  <button id="disconnect" type="button" class="secondary" disabled>
+    このページの接続を終了
+  </button>
+
+  <p class="small">
+    どのPCでも、同じGoogleアカウントを選んでください。
+    このページは作業中、開いたままにしてください。
+  </p>
+
+  <hr>
+
+  <h2>接続テスト</h2>
+  <p class="small">
+    テスト専用のデータを保存します。
+    実際のユーザー一覧・処理履歴は変更しません。
+  </p>
+
+  <button id="testSave" type="button" disabled>テスト保存</button>
+  <button id="testLoad" type="button" class="secondary" disabled>
+    テスト読込
+  </button>
+
+  <p class="small">
+    アプリ専用領域を使用するため、保存データは
+    Google Driveの通常のファイル一覧には表示されません。
+  </p>
+
+  <hr>
+
+  <p id="bridge" class="small"></p>
+  <p class="small">
+    別PCへ移るときは、元のPCで処理を停止し、
+    保存完了を確認してください。複数PCで同時実行しないでください。
+  </p>
+
+  <div id="log" role="log"></div>
+</main>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+
+<script>
+"use strict";
+
+const CLIENT_ID =
+  "928189276125-cl9dr8e7fk0g90ketdukspm274rkb0s7.apps.googleusercontent.com";
+
+const SCOPE =
+  "https://www.googleapis.com/auth/drive.appdata";
+
+const NOTE_ORIGIN = "https://note.com";
+const TEST_NAME = "note-sync-connection-test-v1.json";
+const MAX_BYTES = 3 * 1024 * 1024;
+
+const $ = id => document.getElementById(id);
+
+let token = "";
+let expiresAt = 0;
+let expiryTimer;
+let tokenClient;
+let busyCount = 0;
+let messageQueue = Promise.resolve();
+
+const session = new URLSearchParams(location.hash.slice(1))
+  .get("session") || "";
+
+const bridgeEnabled =
+  !!window.opener &&
+  /^[a-zA-Z0-9_-]{24,150}$/.test(session);
+
+if (location.hash) {
+  history.replaceState(null, "", location.pathname + location.search);
+}
+
+$("bridge").textContent = bridgeEnabled
+  ? "noteとの連携用ウィンドウです。Googleへ接続すると待機します。"
+  : "単独表示です。まずGoogle接続と、保存・読込をテストできます。";
+
+function log(text) {
+  const line = document.createElement("div");
+  line.textContent = new Date().toLocaleTimeString() + " " + text;
+  $("log").append(line);
+
+  while ($("log").children.length > 150) {
+    $("log").firstChild.remove();
+  }
+
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+function connected() {
+  return !!token && Date.now() < expiresAt;
+}
+
+function updateButtons() {
+  const ready = connected();
+  $("connect").disabled = busyCount > 0;
+  $("disconnect").disabled = !ready || busyCount > 0;
+  $("testSave").disabled = !ready || busyCount > 0;
+  $("testLoad").disabled = !ready || busyCount > 0;
+}
+
+function clearConnection(message) {
+  token = "";
+  expiresAt = 0;
+  clearTimeout(expiryTimer);
+  $("state").textContent = message || "Googleには未接続です。";
+  updateButtons();
+}
+
+function requireConnection() {
+  if (!connected()) {
+    clearConnection(
+      "Googleへの再接続が必要です。\n「Googleに接続」を押してください。"
+    );
+    throw new Error("Googleに接続されていません。");
+  }
+}
+
+async function api(path, options = {}) {
+  requireConnection();
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    const response = await fetch(
+      "https://www.googleapis.com" + path,
+      {
+        ...options,
+        headers: {
+          ...(options.headers || {}),
+          Authorization: "Bearer " + token
+        },
+        signal: controller.signal
+      }
+    );
+
+    if (response.status === 401) {
+      clearConnection(
+        "Googleへの再接続が必要です。\n「Googleに接続」を押してください。"
+      );
+      throw new Error("接続の有効期限が切れたか、取り消されました。");
+    }
+
+    if (!response.ok) {
+      const detail = (await response.text()).slice(0, 300);
+      throw new Error("Drive HTTP " + response.status + " " + detail);
+    }
+
+    return response;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function findFile(name) {
+  const params = new URLSearchParams({
+    spaces: "appDataFolder",
+    q: "trashed = false and name = '" + name + "'",
+    fields: "files(id,name),nextPageToken",
+    pageSize: "100"
+  });
+
+  const response = await api("/drive/v3/files?" + params);
+  const data = await response.json();
+
+  if (!Array.isArray(data.files)) {
+    throw new Error("Driveのファイル一覧を確認できません。");
+  }
+
+  if (data.files.length > 1 || data.nextPageToken) {
+    throw new Error(
+      "同じ名前の保存データが複数あります。自動上書きを中止しました。"
+    );
+  }
+
+  return data.files[0] || null;
+}
+
+async function readJSON(name) {
+  const file = await findFile(name);
+  if (!file) return { file: null, data: null };
+
+  const response = await api(
+    "/drive/v3/files/" + encodeURIComponent(file.id) + "?alt=media"
+  );
+
+  const text = await response.text();
+
+  if (new Blob([text]).size > MAX_BYTES) {
+    throw new Error("保存データが大きすぎます。");
+  }
+
+  return { file, data: JSON.parse(text) };
+}
+
+async function writeJSON(name, data, file) {
+  const text = JSON.stringify(data);
+
+  if (new Blob([text]).size > MAX_BYTES) {
+    throw new Error("保存するデータが大きすぎます。");
+  }
+
+  if (file) {
+    const response = await api(
+      "/upload/drive/v3/files/" +
+        encodeURIComponent(file.id) +
+        "?uploadType=media&fields=id",
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json;charset=utf-8" },
+        body: text
+      }
+    );
+
+    return await response.json();
+  }
+
+  const boundary = "note_sync_" + crypto.randomUUID().replace(/-/g, "");
+
+  const metadata = {
+    name,
+    mimeType: "application/json",
+    parents: ["appDataFolder"]
+  };
+
+  const body =
+    "--" + boundary + "\r\n" +
+    "Content-Type: application/json; charset=UTF-8\r\n\r\n" +
+    JSON.stringify(metadata) + "\r\n" +
+    "--" + boundary + "\r\n" +
+    "Content-Type: application/json; charset=UTF-8\r\n\r\n" +
+    text + "\r\n" +
+    "--" + boundary + "--";
+
+  const response = await api(
+    "/upload/drive/v3/files?uploadType=multipart&fields=id",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "multipart/related; boundary=" + boundary
+      },
+      body
+    }
+  );
+
+  return await response.json();
+}
+
+function validateIdentity(owner, sourceKey) {
+  if (!/^[a-zA-Z0-9_]+$/.test(owner || "")) {
+    throw new Error("noteのユーザー名が不正です。");
+  }
+
+  if (!/^n[0-9a-f]+$/i.test(sourceKey || "")) {
+    throw new Error("対象記事のキーが不正です。");
+  }
+}
+
+function validateProgress(progress, owner, sourceKey) {
+  if (!progress ||
+      progress.version !== 3 ||
+      progress.owner !== owner ||
+      progress.sourceKey !== sourceKey ||
+      !Array.isArray(progress.items) ||
+      progress.items.length > 1500 ||
+      !progress.results ||
+      typeof progress.results !== "object" ||
+      Array.isArray(progress.results)) {
+    throw new Error("作業データの形式・アカウント・対象記事を確認できません。");
+  }
+
+  const ids = new Set();
+  const names = new Set();
+
+  for (const item of progress.items) {
+    if (!item ||
+        !/^[a-zA-Z0-9_]+$/.test(item.username || "") ||
+        typeof item.uid !== "string" ||
+        !(
+          /^id:[0-9]+$/.test(item.uid) ||
+          item.uid === "name:" + item.username
+        ) ||
+        ids.has(item.uid) ||
+        names.has(item.username)) {
+      throw new Error("ユーザー一覧に不正または重複があります。");
+    }
+
+    ids.add(item.uid);
+    names.add(item.username);
+  }
+
+  if (new Blob([JSON.stringify(progress)]).size > MAX_BYTES) {
+    throw new Error("作業データが大きすぎます。");
+  }
+}
+
+function validateDocument(document, owner, sourceKey) {
+  if (!document ||
+      document.schema !== "nsk-drive-v1" ||
+      typeof document.revision !== "string" ||
+      !document.revision) {
+    throw new Error("クラウド保存データの形式が不正です。");
+  }
+
+  validateProgress(document.progress, owner, sourceKey);
+}
+
+async function handleMessage(message) {
+  if (message.op === "hello") {
+    return {
+      ready: connected(),
+      protocol: 1
+    };
+  }
+
+  requireConnection();
+
+  const owner = message.owner;
+  const sourceKey = message.sourceKey;
+  validateIdentity(owner, sourceKey);
+
+  const name = "note-sync-v3-" + owner + "-" + sourceKey + ".json";
+
+  if (message.op === "load") {
+    const remote = await readJSON(name);
+
+    if (!remote.data) {
+      log("進捗読込：保存データなし／" + sourceKey);
+      return { revision: null, progress: null };
+    }
+
+    validateDocument(remote.data, owner, sourceKey);
+    log("進捗を読み込みました／" + sourceKey);
+
+    return {
+      revision: remote.data.revision,
+      progress: remote.data.progress,
+      savedAt: remote.data.savedAt
+    };
+  }
+
+  if (message.op === "save") {
+    validateProgress(message.progress, owner, sourceKey);
+
+    if (message.expectedRevision !== null &&
+        typeof message.expectedRevision !== "string") {
+      throw new Error("保存データの世代情報がありません。");
+    }
+
+    const remote = await readJSON(name);
+
+    if (remote.data) {
+      validateDocument(remote.data, owner, sourceKey);
+    }
+
+    const revision = remote.data?.revision || null;
+
+    if (revision !== message.expectedRevision) {
+      throw new Error(
+        "別の保存結果があります。上書きを停止しました。最新データを読み直してください。"
+      );
+    }
+
+    const document = {
+      schema: "nsk-drive-v1",
+      revision: crypto.randomUUID(),
+      savedAt: new Date().toISOString(),
+      progress: message.progress
+    };
+
+    await writeJSON(name, document, remote.file);
+
+    const check = await readJSON(name);
+
+    if (check.data?.revision !== document.revision) {
+      throw new Error(
+        "保存後の確認に失敗しました。自動再送せず停止してください。"
+      );
+    }
+
+    log("進捗を保存しました／" + sourceKey);
+
+    return {
+      revision: document.revision,
+      savedAt: document.savedAt
+    };
+  }
+
+  throw new Error("未対応の操作です。");
+}
+
+window.addEventListener("message", event => {
+  if (!bridgeEnabled ||
+      event.origin !== NOTE_ORIGIN ||
+      event.source !== window.opener) {
+    return;
+  }
+
+  const message = event.data;
+
+  if (!message ||
+      message.type !== "NSK_DRIVE_REQUEST" ||
+      message.session !== session ||
+      typeof message.id !== "string" ||
+      message.id.length > 150) {
+    return;
+  }
+
+  const reply = result => {
+    event.source.postMessage(
+      {
+        type: "NSK_DRIVE_RESPONSE",
+        session,
+        id: message.id,
+        ...result
+      },
+      NOTE_ORIGIN
+    );
+  };
+
+  messageQueue = messageQueue.then(async () => {
+    busyCount++;
+    updateButtons();
+
+    try {
+      const result = await handleMessage(message);
+      reply({ ok: true, result });
+    } catch (error) {
+      log("連携エラー：" + error.message);
+      reply({ ok: false, error: error.message });
+    } finally {
+      busyCount--;
+      updateButtons();
+    }
+  }).catch(error => {
+    log("処理エラー：" + error.message);
+  });
+});
+
+$("connect").onclick = () => {
+  if (!window.google?.accounts?.oauth2) {
+    log("Googleの接続機能を読み込み中です。少し待って再度押してください。");
+    return;
+  }
+
+  if (!tokenClient) {
+    tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: CLIENT_ID,
+      scope: SCOPE,
+      include_granted_scopes: false,
+
+      callback: response => {
+        if (response.error || !response.access_token) {
+          clearConnection("Googleへの接続が完了しませんでした。");
+          log("接続エラー：" + (response.error || "認証情報なし"));
+          return;
+        }
+
+        if (!google.accounts.oauth2.hasGrantedAllScopes(response, SCOPE)) {
+          clearConnection("必要な保存権限が許可されていません。");
+          return;
+        }
+
+        const seconds = Number(response.expires_in);
+
+        if (!Number.isFinite(seconds) || seconds <= 30) {
+          clearConnection("接続の有効期限を確認できませんでした。");
+          return;
+        }
+
+        token = response.access_token;
+        expiresAt = Date.now() + (seconds - 30) * 1000;
+
+        clearTimeout(expiryTimer);
+
+        expiryTimer = setTimeout(() => {
+          clearConnection(
+            "接続の有効期限が近づきました。\n「Googleに接続」で再接続してください。"
+          );
+          log("再接続が必要です。");
+        }, expiresAt - Date.now());
+
+        $("state").textContent =
+          "Googleに接続しました。\n保存・読込ができます。";
+
+        log("Googleに接続しました。");
+        updateButtons();
+      },
+
+      error_callback: error => {
+        log(
+          "接続ウィンドウを開けなかったか、接続が中断されました：" +
+          (error.type || "不明")
+        );
+      }
+    });
+  }
+
+  tokenClient.requestAccessToken({ prompt: "select_account" });
+};
+
+$("disconnect").onclick = () => {
+  clearConnection("このページの接続を終了しました。");
+  log("接続情報をページのメモリから消去しました。");
+};
+
+$("testSave").onclick = async () => {
+  busyCount++;
+  updateButtons();
+
+  try {
+    const current = await readJSON(TEST_NAME);
+    const test = {
+      kind: "note-sync-connection-test",
+      savedAt: new Date().toISOString(),
+      message: "接続テスト成功"
+    };
+
+    await writeJSON(TEST_NAME, test, current.file);
+    log("テスト保存成功：" + test.savedAt);
+  } catch (error) {
+    log("テスト保存失敗：" + error.message);
+  } finally {
+    busyCount--;
+    updateButtons();
+  }
+};
+
+$("testLoad").onclick = async () => {
+  busyCount++;
+  updateButtons();
+
+  try {
+    const result = await readJSON(TEST_NAME);
+
+    if (!result.data) {
+      log("テストデータがありません。先に「テスト保存」を押してください。");
+    } else {
+      log("テスト読込成功：保存日時 " + result.data.savedAt);
+    }
+  } catch (error) {
+    log("テスト読込失敗：" + error.message);
+  } finally {
+    busyCount--;
+    updateButtons();
+  }
+};
+
+updateButtons();
+log("ページを開きました。「Googleに接続」を押してください。");
+</script>
 </body>
 </html>
